@@ -1,13 +1,17 @@
+import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List, Optional
+
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+from pydantic import BaseModel
+from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 SECRET_KEY = "ZF_CAI_CYBER_TELEMETRY_SECRET_KEY"
 ALGORITHM = "HS256"
@@ -85,7 +89,6 @@ class Token(BaseModel):
     access_token: str
     token_type: str
 
-# App Setup & Seed
 app = FastAPI(title="ZF CAI Telematics API", version="1.0.0")
 
 app.add_middleware(
@@ -144,6 +147,22 @@ def verify_token(token: str = Depends(oauth2_scheme)):
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired or corrupt")
 
+# Frontend Static File Routes
+@app.get("/")
+def serve_frontend():
+    html_path = Path(__file__).resolve().parent.parent / "frontend" / "code.html"
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail=f"code.html not found at {html_path}")
+    return FileResponse(html_path)
+
+@app.get("/admin")
+def serve_admin():
+    html_path = Path(__file__).resolve().parent.parent / "frontend" / "admin.html"
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail=f"admin.html not found at {html_path}")
+    return FileResponse(html_path)
+
+# Public Endpoints
 @app.get("/api/v1/content", response_model=ContentSchema)
 def read_content(db: Session = Depends(get_db)):
     return db.query(ContentDB).first()
@@ -159,6 +178,7 @@ def submit_transmission(tx: TransmissionCreate, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "ACK", "message": "Payload ingested to mission control queue."}
 
+# Admin & Operator Endpoints
 @app.post("/api/v1/admin/login", response_model=Token)
 def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
     if form_data.username == "zf_operator" and form_data.password == "telemetry@2026":
@@ -168,15 +188,6 @@ def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
         )
         return {"access_token": token, "token_type": "bearer"}
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid tactical credentials")
-
-@app.put("/api/v1/admin/content", response_model=ContentSchema)
-def update_content(content: ContentSchema, db: Session = Depends(get_db), _: str = Depends(verify_token)):
-    c = db.query(ContentDB).first()
-    for key, val in content.model_dump().items():
-        setattr(c, key, val)
-    db.commit()
-    db.refresh(c)
-    return c
 
 @app.post("/api/v1/admin/projects", response_model=ProjectSchema)
 def create_project(proj: ProjectSchema, db: Session = Depends(get_db), _: str = Depends(verify_token)):
