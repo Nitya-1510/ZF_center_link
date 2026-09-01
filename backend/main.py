@@ -1,4 +1,3 @@
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
@@ -17,7 +16,9 @@ SECRET_KEY = "ZF_CAI_CYBER_TELEMETRY_SECRET_KEY"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 480
 
-DATABASE_URL = "sqlite:///./telemetry.db"
+DB_PATH = Path(__file__).resolve().parent / "telemetry.db"
+DATABASE_URL = f"sqlite:///{DB_PATH}"
+
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -43,6 +44,7 @@ class ProjectDB(Base):
     lead = Column(String)
     description = Column(Text)
     tech_tags = Column(String)
+    category = Column(String, default="Project")  # "Project", "Copyright", or "Patent"
 
 class TransmissionDB(Base):
     __tablename__ = "transmissions"
@@ -52,25 +54,27 @@ class TransmissionDB(Base):
     encrypted_payload = Column(Text)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
+class AttendanceDB(Base):
+    __tablename__ = "attendance_records"
+    id = Column(Integer, primary_key=True, index=True)
+    session_date = Column(String, index=True)
+    slot_time = Column(String)
+    topic_taught = Column(Text, default="")
+    students_json = Column(Text, default="[]")
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
 Base.metadata.create_all(bind=engine)
 
 # Schemas
-class ContentSchema(BaseModel):
-    hero_title: str
-    can_bus_speed: str
-    active_projects: str
-    publications: str
-    collaborations: str
-    test_bench_status: str
-    class Config:
-        from_attributes = True
-
 class ProjectSchema(BaseModel):
+    id: Optional[int] = None
     project_code: str
     title: str
     lead: str
     description: str
     tech_tags: str
+    category: str = "Project"
+
     class Config:
         from_attributes = True
 
@@ -82,14 +86,21 @@ class TransmissionCreate(BaseModel):
 class TransmissionSchema(TransmissionCreate):
     id: int
     timestamp: datetime
+
     class Config:
         from_attributes = True
+
+class AttendanceSchema(BaseModel):
+    session_date: str
+    slot_time: str
+    topic_taught: str
+    students_json: str
 
 class Token(BaseModel):
     access_token: str
     token_type: str
 
-app = FastAPI(title="ZF CAI Telematics API", version="1.0.0")
+app = FastAPI(title="ZF CAI Management & Telematics API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -118,14 +129,24 @@ def seed_data():
                 title="BMS Real-Time Thermal Estimator",
                 lead="Dr. Elena Rostova",
                 description="High-frequency state-of-charge edge estimation pipeline executing over ISO 26262 ASIL-D compliant CAN nodes.",
-                tech_tags="PyTorch,C++,CANopen,RTLAB"
+                tech_tags="PyTorch,C++,CANopen,RTLAB",
+                category="Project"
             ),
             ProjectDB(
-                project_code="02: PROJ-002",
-                title="Drive-by-Wire Steering Gateway",
+                project_code="02: PAT-001",
+                title="Drive-by-Wire Steer Torque Decoupler",
                 lead="Marcus Vance",
                 description="Sub-millisecond fail-operational steer-by-wire controller with physical layer fault injection telemetry.",
-                tech_tags="Simulink,AUTOSAR,FPGA,Rust"
+                tech_tags="Simulink,AUTOSAR,FPGA,Hardware IP",
+                category="Patent"
+            ),
+            ProjectDB(
+                project_code="03: CPR-001",
+                title="CAN-Sec Real-Time Frame Validator Software",
+                lead="Samira El-Amin",
+                description="Registered algorithmic suite for lightweight symmetric payload verification across automotive ECUs.",
+                tech_tags="Rust,CAN-FD,Cryptography",
+                category="Copyright"
             )
         ])
     db.commit()
@@ -142,12 +163,12 @@ def verify_token(token: str = Depends(oauth2_scheme)):
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         if username != "zf_operator":
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid identity")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid operator key")
         return username
     except JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired or corrupt")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
 
-# Frontend Static File Routes
+# Static File Endpoints
 @app.get("/")
 def serve_frontend():
     html_path = Path(__file__).resolve().parent.parent / "frontend" / "code.html"
@@ -163,10 +184,6 @@ def serve_admin():
     return FileResponse(html_path)
 
 # Public Endpoints
-@app.get("/api/v1/content", response_model=ContentSchema)
-def read_content(db: Session = Depends(get_db)):
-    return db.query(ContentDB).first()
-
 @app.get("/api/v1/projects", response_model=List[ProjectSchema])
 def list_projects(db: Session = Depends(get_db)):
     return db.query(ProjectDB).all()
@@ -178,7 +195,7 @@ def submit_transmission(tx: TransmissionCreate, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "ACK", "message": "Payload ingested to mission control queue."}
 
-# Admin & Operator Endpoints
+# Admin Endpoints
 @app.post("/api/v1/admin/login", response_model=Token)
 def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
     if form_data.username == "zf_operator" and form_data.password == "telemetry@2026":
@@ -187,16 +204,59 @@ def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
             expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         )
         return {"access_token": token, "token_type": "bearer"}
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid tactical credentials")
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid operator credentials")
 
 @app.post("/api/v1/admin/projects", response_model=ProjectSchema)
 def create_project(proj: ProjectSchema, db: Session = Depends(get_db), _: str = Depends(verify_token)):
-    p = ProjectDB(**proj.model_dump())
+    p = ProjectDB(**proj.model_dump(exclude={"id"}))
     db.add(p)
     db.commit()
     db.refresh(p)
     return p
 
+@app.delete("/api/v1/admin/projects/{project_id}")
+def delete_project(project_id: int, db: Session = Depends(get_db), _: str = Depends(verify_token)):
+    p = db.query(ProjectDB).filter(ProjectDB.id == project_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Project/IP record not found")
+    db.delete(p)
+    db.commit()
+    return {"status": "SUCCESS", "message": f"Asset #{project_id} deleted."}
+
+@app.get("/api/v1/admin/attendance")
+def get_attendance(session_date: str, slot_time: str, db: Session = Depends(get_db), _: str = Depends(verify_token)):
+    rec = db.query(AttendanceDB).filter(AttendanceDB.session_date == session_date, AttendanceDB.slot_time == slot_time).first()
+    if not rec:
+        return {"session_date": session_date, "slot_time": slot_time, "topic_taught": "", "students_json": "[]"}
+    return rec
+
+@app.post("/api/v1/admin/attendance")
+def save_attendance(payload: AttendanceSchema, db: Session = Depends(get_db), _: str = Depends(verify_token)):
+    rec = db.query(AttendanceDB).filter(AttendanceDB.session_date == payload.session_date, AttendanceDB.slot_time == payload.slot_time).first()
+    if not rec:
+        rec = AttendanceDB(
+            session_date=payload.session_date,
+            slot_time=payload.slot_time,
+            topic_taught=payload.topic_taught,
+            students_json=payload.students_json
+        )
+        db.add(rec)
+    else:
+        rec.topic_taught = payload.topic_taught
+        rec.students_json = payload.students_json
+        rec.updated_at = datetime.utcnow()
+    db.commit()
+    return {"status": "SUCCESS", "message": "Attendance & topic ledger synchronized."}
+
 @app.get("/api/v1/admin/transmissions", response_model=List[TransmissionSchema])
 def get_transmissions(db: Session = Depends(get_db), _: str = Depends(verify_token)):
     return db.query(TransmissionDB).order_by(TransmissionDB.timestamp.desc()).all()
+
+@app.delete("/api/v1/admin/transmissions/{tx_id}")
+def delete_transmission(tx_id: int, db: Session = Depends(get_db), _: str = Depends(verify_token)):
+    tx = db.query(TransmissionDB).filter(TransmissionDB.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transmission not found")
+    db.delete(tx)
+    db.commit()
+    return {"status": "SUCCESS", "message": f"Transmission #{tx_id} cleared from database."}
