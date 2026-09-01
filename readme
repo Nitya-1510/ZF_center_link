@@ -1,0 +1,7 @@
+python -m uvicorn backend.main:app --reload --port 8000
+
+cd backend
+uvicorn main:app --reload --port 8000
+
+Username / Operator ID: zf_operator
+Password / Passkey: telemetry@2026
